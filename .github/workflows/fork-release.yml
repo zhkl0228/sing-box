@@ -31,10 +31,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -87,7 +87,11 @@ jobs:
           # 发出去之前自检两件事，免得发一个"看着对、装上去没 stats"的包：
           #   1. patch 有没有真生效（stats 子命令在不在）
           #   2. ldflags 有没有生效（版本号对不对，直接决定节点会不会误判为需要升级）
-          go build -tags "$TAGS" -o /tmp/sb-verify ./cmd/sing-box
+          # ldflags 必须和上面 Build 那步一模一样，否则版本号是默认的 unknown，
+          # 这一步就变成了检查自己有没有传 ldflags（真踩过）
+          go build -trimpath \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' -s -w -buildid=" \
+            -tags "$TAGS" -o /tmp/sb-verify ./cmd/sing-box
           /tmp/sb-verify stats --help > /dev/null
           ACTUAL=$(/tmp/sb-verify version | head -1 | awk '{print $3}')
           if [ "$ACTUAL" != "$VERSION" ]; then
