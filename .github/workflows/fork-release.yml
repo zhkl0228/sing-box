@@ -1,0 +1,124 @@
+name: "Fork release (linux)"
+
+# 本 fork 专用的发布流程：构建带 with_v2ray_api 的 linux 二进制并挂到 GitHub Release。
+# 与上游的发布流程刻意分开——上游那套要签名、要分发到别处，需要本 fork 没有的 secret。
+#
+# fork 相对上游只有两个文件的差异：
+#   - cmd/sing-box/cmd_stats.go        读 v2ray_api 流量计数器的子命令
+#   - .github/workflows/fork-release.yml  本文件
+# 为什么需要它们，见 pac 项目 README 的「为什么用 fork（zhkl0228/sing-box）」一节。
+#
+# 触发：推一个 fork-v* 的 tag（pac 项目的 tools/singbox-fork-release.sh 会替你建分支、
+# 带 patch、打 tag），或在 Actions 页手动跑并填版本号。
+
+on:
+  push:
+    tags:
+      - "fork-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号，如 1.14.1（手动触发时必填，须与上游版本一致、不带后缀）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build & release (linux amd64/arm64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve version and build tags
+        run: |
+          set -eu
+          # 版本号必须**跟随上游、不带任何后缀**：上报侧 cron.py 的 _parse_version 会把
+          # '1.14.1-fork' 解析成 (1,14,0)，比官方 (1,14,1) 还小，节点的自动更新反而会把
+          # fork 版覆盖回官方版。所以 tag fork-vX.Y.Z 对应的版本号就是 X.Y.Z。
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            VER="${GITHUB_REF_NAME#fork-v}"
+          else
+            VER="${{ inputs.version }}"
+          fi
+          if [ -z "$VER" ]; then
+            echo "无法确定版本号：tag 触发请用 fork-vX.Y.Z，手动触发请填 version" >&2
+            exit 1
+          fi
+          case "$VER" in
+            [0-9]*) ;;
+            *) echo "版本号必须以数字开头（收到: $VER）" >&2; exit 1 ;;
+          esac
+          echo "VERSION=$VER" >> "$GITHUB_ENV"
+          # 构建 tags 从上游文件现读，上游加减 tag 时自动跟上。用 _OTHERS 而不是
+          # DEFAULT_BUILD_TAGS：后者含 with_naive_outbound，要 CGO(cronet-go)，纯静态
+          # 交叉编译过不去；本项目的节点只用 direct 出站，不需要它。
+          echo "TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS),with_v2ray_api" >> "$GITHUB_ENV"
+
+      - name: Build linux amd64/arm64
+        run: |
+          set -eu
+          echo "version=$VERSION"
+          echo "tags=$TAGS"
+          for ARCH in amd64 arm64; do
+            DIR="dist/sing-box-${VERSION}-linux-${ARCH}"
+            mkdir -p "$DIR"
+            GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 go build \
+              -trimpath \
+              -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' -s -w -buildid=" \
+              -tags "$TAGS" -o "$DIR/sing-box" ./cmd/sing-box
+            cp LICENSE "$DIR/" 2>/dev/null || true
+            # 资产名与上游保持一致：安装脚本与 cron.py 的下载逻辑只差一个仓库名，文件名照抄上游
+            (cd dist && tar -czf "sing-box-${VERSION}-linux-${ARCH}.tar.gz" "sing-box-${VERSION}-linux-${ARCH}")
+          done
+          ls -lh dist/*.tar.gz
+
+      - name: Verify artifacts
+        run: |
+          set -eu
+          # 发出去之前自检两件事，免得发一个"看着对、装上去没 stats"的包：
+          #   1. patch 有没有真生效（stats 子命令在不在）
+          #   2. ldflags 有没有生效（版本号对不对，直接决定节点会不会误判为需要升级）
+          go build -tags "$TAGS" -o /tmp/sb-verify ./cmd/sing-box
+          /tmp/sb-verify stats --help > /dev/null
+          ACTUAL=$(/tmp/sb-verify version | head -1 | awk '{print $3}')
+          if [ "$ACTUAL" != "$VERSION" ]; then
+            echo "版本号不符：期望 $VERSION，实际 $ACTUAL" >&2
+            exit 1
+          fi
+          echo "OK: version=$ACTUAL，stats 子命令存在"
+
+      - name: Checksums
+        run: |
+          set -eu
+          cd dist && sha256sum *.tar.gz > checksums.txt && cat checksums.txt
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          body: |
+            基于上游 v${{ env.VERSION }}，两处差异：
+
+            1. 构建时带 `with_v2ray_api`（官方发布版不含，配了 v2ray_api 连 `sing-box check` 都过不去），用于按用户统计流量。
+            2. 新增 `sing-box stats` 子命令查 v2ray_api 的流量计数器——自带的 `api` 子命令走 clash_api，读不到按用户计的流量；而 v2ray_api 自带的客户端桩和服务端注册的服务名对不上（服务端在 `stats.go` 的 init 里改成了 v2ray 标准名），自己调自己会报 `unknown service`，xray 的 CLI 同样查不了。
+
+            构建 tags 取自上游 `release/DEFAULT_BUILD_TAGS_OTHERS` 加 `with_v2ray_api`，相比官方 linux 发布版少 `with_naive_outbound`（那个要 CGO，且本项目节点只用 direct 出站）。
+
+            用法：
+
+            ```
+            sing-box stats --server 127.0.0.1:18080 --pattern 'user>>>' --reset
+            ```
